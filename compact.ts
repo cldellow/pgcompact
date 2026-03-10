@@ -18,7 +18,7 @@
  *   pg_compact.ts resume  <table> [--batch N] [--schema S]
  *   pg_compact.ts status  [table] [--schema S]
  *   pg_compact.ts swap    <table> [--lock-timeout MS] [--schema S]
- *   pg_compact.ts abort   <table> [--schema S]
+ *   pg_compact.ts abort   <table> [--schema S]   (cancel in-progress job)
  *   pg_compact.ts abort-all
  *
  * Environment:
@@ -636,12 +636,17 @@ async function doSwap(
     throw e;
   }
 
-  await saveJob(schema, table, { phase: "swapped" });
+  // Clean up CDC artifacts (log table, trigger function, job row)
+  try { await exec(`DROP TABLE IF EXISTS ${logTbl}`); } catch {}
+  try { await exec(`DROP FUNCTION IF EXISTS ${fqn(COMPACT_SCHEMA, `trig_${table}`)}()`); } catch {}
+  await exec(`
+    DELETE FROM ${q(COMPACT_SCHEMA)}.jobs
+    WHERE source_schema = ${lit(schema)} AND source_table = ${lit(table)}
+  `);
 
   info("");
   info(`${BOLD}SUCCESS.${RESET} Old table kept as ${schema}.${oldName}`);
   info(`  Verify, then drop it:  DROP TABLE ${fqn(schema, oldName)};`);
-  info(`  Clean up metadata:     pg_compact.ts abort ${table}`);
   return true;
 }
 
@@ -881,8 +886,8 @@ ${BOLD}COMMANDS${RESET}
   resume  <table>   Resume after interruption
   status  [table]   Show progress (all jobs if table omitted)
   swap    <table>   Final cutover (brief ACCESS EXCLUSIVE lock)
-  abort   <table>   Cancel and clean up
-  abort-all         Cancel all active jobs
+  abort   <table>   Cancel an in-progress job and clean up
+  abort-all         Cancel all in-progress jobs
 
 ${BOLD}OPTIONS${RESET}
   --dsn <url>           Connection string (default: $DATABASE_URL or $POSTGRES_URL)
@@ -895,7 +900,6 @@ ${BOLD}WORKFLOW${RESET}
   2. pg_compact.ts status shopify_data__product    # monitor
   3. pg_compact.ts swap   shopify_data__product    # cutover (<1s lock)
   4. DROP TABLE public.shopify_data__product__pre_compact;
-  5. pg_compact.ts abort  shopify_data__product    # clean metadata
 
 ${BOLD}MONITOR FROM PSQL${RESET}
   SELECT * FROM _compact.jobs;
