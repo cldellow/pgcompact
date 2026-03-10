@@ -539,6 +539,10 @@ async function doSwap(
   const trigName = q(`_compact_cdc_${table}`);
   const oldName = `${table}__pre_compact`;
 
+  // Collect index names from both tables before the swap
+  const srcIndexes = await getIndexDefs(schema, table);
+  const shadowIndexes = await getIndexDefs(COMPACT_SCHEMA, shadow);
+
   // Pre-swap catch-up (no lock)
   info("Pre-swap catch-up replay...");
   let { seq, replayed } = await replayChanges(
@@ -599,6 +603,23 @@ async function doSwap(
       await tx.unsafe(`ALTER TABLE ${src} RENAME TO ${q(oldName)}`);
       await tx.unsafe(`ALTER TABLE ${dst} SET SCHEMA ${q(schema)}`);
       await tx.unsafe(`ALTER TABLE ${fqn(schema, shadow)} RENAME TO ${q(table)}`);
+
+      // Rename indexes: first move old indexes out of the way, then give
+      // the new indexes their original names.
+      for (const idx of srcIndexes) {
+        await tx.unsafe(
+          `ALTER INDEX ${fqn(schema, idx.relname)} RENAME TO ${q(idx.relname + "__pre_compact")}`
+        );
+      }
+      for (const idx of shadowIndexes) {
+        // Find the original name by stripping the _compact_ prefix
+        const origName = idx.relname.replace(/^_compact_/, "");
+        if (origName !== idx.relname) {
+          await tx.unsafe(
+            `ALTER INDEX ${fqn(schema, idx.relname)} RENAME TO ${q(origName)}`
+          );
+        }
+      }
 
       const elapsedMs = Date.now() - t0;
       info(`  swap complete — lock held for ${elapsedMs} ms.`);
