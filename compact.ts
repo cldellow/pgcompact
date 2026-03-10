@@ -97,6 +97,27 @@ function fqn(schema: string, table: string): string {
   return `${q(schema)}.${q(table)}`;
 }
 
+/** Row-value constructor for column references: (col1, col2, ...) */
+function pkTuple(pkCols: string[]): string {
+  return `(${pkCols.map(q).join(", ")})`;
+}
+
+/** Row-value constructor for literal values: ('v1', 'v2', ...) */
+function pkLit(vals: string[]): string {
+  return `(${vals.map(lit).join(", ")})`;
+}
+
+/** Serialize compound PK values for storage in last_copied_id. */
+function serializePk(vals: string[]): string {
+  return JSON.stringify(vals);
+}
+
+/** Deserialize compound PK values from last_copied_id. */
+function deserializePk(s: string | null): string[] | null {
+  if (s === null) return null;
+  return JSON.parse(s);
+}
+
 /** Run arbitrary SQL, return rows as plain objects. */
 async function query<T = Record<string, unknown>>(sqlText: string): Promise<T[]> {
   return (await db.unsafe(sqlText)) as T[];
@@ -338,72 +359,77 @@ async function installTrigger(
 }
 
 interface BulkCopyResult {
-  lastId: string | null;
+  lastPk: string[] | null;
   total: number;
   finished: boolean;
 }
 
 async function bulkCopy(
-  schema: string, table: string, shadow: string, pkCol: string,
-  batchSize: number, lastId: string | null, rowsSoFar: number
+  schema: string, table: string, shadow: string, pkCols: string[],
+  batchSize: number, lastPk: string[] | null, rowsSoFar: number
 ): Promise<BulkCopyResult> {
   const src = fqn(schema, table);
   const dst = fqn(COMPACT_SCHEMA, shadow);
   const cols = await getColumns(schema, table);
   const estRows = await getRowEstimate(schema, table);
+  const pk = pkTuple(pkCols);
+  const pkSelect = pkCols.map(q).join(", ");
+  const pkOrder = pkCols.map(q).join(", ");
 
   let total = rowsSoFar;
-  let last = lastId;
+  let last = lastPk;
   let lastLogTime = Date.now();
 
   while (!interrupted) {
-    const whereClause = last === null ? "" : `WHERE ${q(pkCol)} > ${lit(last)}`;
+    const whereClause = last === null ? "" : `WHERE ${pk} > ${pkLit(last)}`;
 
-    // Find the max PK in this batch
-    const maxRow = await queryOne<{ max_id: string | null }>(`
-      SELECT max(t.${q(pkCol)}) AS max_id FROM (
-        SELECT ${q(pkCol)} FROM ${src}
+    // Find the boundary PK of this batch (the last row in PK order)
+    const maxRow = await queryOne<Record<string, string | null>>(`
+      SELECT ${pkSelect} FROM (
+        SELECT ${pkSelect} FROM ${src}
         ${whereClause}
-        ORDER BY ${q(pkCol)}
+        ORDER BY ${pkOrder}
         LIMIT ${batchSize}
       ) t
+      ORDER BY ${pkCols.map(c => `${q(c)} DESC`).join(", ")}
+      LIMIT 1
     `);
-    const batchMaxId = maxRow?.max_id ?? null;
+    const batchMaxPk = maxRow ? pkCols.map(c => maxRow[c] ?? "") : null;
 
-    if (batchMaxId === null) {
+    if (batchMaxPk === null) {
       await saveJob(schema, table, {
-        phase: "copied", last_copied_id: last, rows_copied: total,
+        phase: "copied", last_copied_id: last === null ? null : serializePk(last), rows_copied: total,
       });
       info(`Bulk copy complete: ${total.toLocaleString()} rows copied.`);
-      return { lastId: last, total, finished: true };
+      return { lastPk: last, total, finished: true };
     }
 
     // Copy the batch in a transaction with progress update
     const lowerBound = last === null
       ? ""
-      : `${q(pkCol)} > ${lit(last)} AND`;
+      : `${pk} > ${pkLit(last)} AND`;
 
     await db.begin(async (tx) => {
       await tx.unsafe(`
         INSERT INTO ${dst} (${cols})
         SELECT ${cols} FROM ${src}
-        WHERE ${lowerBound} ${q(pkCol)} <= ${lit(batchMaxId)}
-        ORDER BY ${q(pkCol)}
+        WHERE ${lowerBound} ${pk} <= ${pkLit(batchMaxPk)}
+        ORDER BY ${pkOrder}
       `);
 
       // Count inserted
       const countRows = await tx.unsafe(
         `SELECT count(*) AS n FROM ${dst}
-         WHERE ${last === null ? "true" : `${q(pkCol)} > ${lit(last)}`}
-           AND ${q(pkCol)} <= ${lit(batchMaxId)}`
+         WHERE ${last === null ? "true" : `${pk} > ${pkLit(last)}`}
+           AND ${pk} <= ${pkLit(batchMaxPk)}`
       );
       const inserted = Number((countRows[0] as any)?.n ?? 0);
       total += inserted;
-      last = batchMaxId;
+      last = batchMaxPk;
 
       await tx.unsafe(`
         UPDATE ${q(COMPACT_SCHEMA)}.jobs
-        SET last_copied_id = ${lit(last)}, rows_copied = ${total}, updated_at = now()
+        SET last_copied_id = ${lit(serializePk(last))}, rows_copied = ${total}, updated_at = now()
         WHERE source_schema = ${lit(schema)} AND source_table = ${lit(table)}
       `);
     });
@@ -411,13 +437,13 @@ async function bulkCopy(
     const now = Date.now();
     if (now - lastLogTime >= LOG_EVERY_MS) {
       const pct = estRows > 0 ? ((total / estRows) * 100).toFixed(1) : "?";
-      info(`  copied ${total.toLocaleString()} rows (${pct}%) — last id: ${trunc(last, 40)}`);
+      info(`  copied ${total.toLocaleString()} rows (${pct}%) — last pk: ${trunc(last.join(", "), 40)}`);
       lastLogTime = now;
     }
   }
 
   warn(`Stopped after ${total.toLocaleString()} rows. Resume with: pg_compact.ts resume ${table}`);
-  return { lastId: last, total, finished: false };
+  return { lastPk: last, total, finished: false };
 }
 
 async function createIndexes(schema: string, table: string, shadow: string) {
@@ -458,12 +484,14 @@ interface ReplayResult {
 
 async function replayChanges(
   schema: string, table: string, shadow: string, logTable: string,
-  pkCol: string, fromSeq: number
+  pkCols: string[], fromSeq: number
 ): Promise<ReplayResult> {
   const src = fqn(schema, table);
   const dst = fqn(COMPACT_SCHEMA, shadow);
   const logTbl = fqn(COMPACT_SCHEMA, logTable);
   const cols = await getColumns(schema, table);
+  const pk = pkTuple(pkCols);
+  const pkSelect = pkCols.map(q).join(", ");
   const REPLAY_BATCH = 10_000;
 
   let totalReplayed = 0;
@@ -471,7 +499,7 @@ async function replayChanges(
 
   while (true) {
     const changes = await query<{ seq: string; op: string; [key: string]: string }>(`
-      SELECT seq, op, ${q(pkCol)}
+      SELECT seq, op, ${pkSelect}
       FROM ${logTbl}
       WHERE seq > ${currentSeq}
       ORDER BY seq
@@ -484,27 +512,29 @@ async function replayChanges(
 
     const maxSeq = Number(changes[changes.length - 1].seq);
 
-    // Deduplicate: for each PK, only the latest operation matters
-    const latest = new Map<string, string>();
+    // Deduplicate: for each composite PK, only the latest operation matters
+    const latest = new Map<string, { op: string; vals: string[] }>();
     for (const row of changes) {
-      latest.set(row[pkCol], row.op.trim());
+      const vals = pkCols.map(c => row[c]);
+      const key = vals.join("\0");
+      latest.set(key, { op: row.op.trim(), vals });
     }
 
-    const allIds = [...latest.keys()];
-    const upsertIds = allIds.filter((pk) => latest.get(pk) !== "D");
+    const allEntries = [...latest.values()];
+    const upsertEntries = allEntries.filter(e => e.op !== "D");
 
     await db.begin(async (tx) => {
-      if (allIds.length > 0) {
-        const idList = allIds.map(lit).join(", ");
-        await tx.unsafe(`DELETE FROM ${dst} WHERE ${q(pkCol)} IN (${idList})`);
+      if (allEntries.length > 0) {
+        const idList = allEntries.map(e => pkLit(e.vals)).join(", ");
+        await tx.unsafe(`DELETE FROM ${dst} WHERE ${pk} IN (${idList})`);
       }
 
-      if (upsertIds.length > 0) {
-        const idList = upsertIds.map(lit).join(", ");
+      if (upsertEntries.length > 0) {
+        const idList = upsertEntries.map(e => pkLit(e.vals)).join(", ");
         await tx.unsafe(`
           INSERT INTO ${dst} (${cols})
           SELECT ${cols} FROM ${src}
-          WHERE ${q(pkCol)} IN (${idList})
+          WHERE ${pk} IN (${idList})
         `);
       }
 
@@ -530,7 +560,7 @@ async function countPendingChanges(logTable: string, fromSeq: number): Promise<n
 
 async function doSwap(
   schema: string, table: string, shadow: string, logTable: string,
-  pkCol: string, replaySeq: number, lockTimeoutMs: number
+  pkCols: string[], replaySeq: number, lockTimeoutMs: number
 ): Promise<boolean> {
   const src = fqn(schema, table);
   const dst = fqn(COMPACT_SCHEMA, shadow);
@@ -538,6 +568,8 @@ async function doSwap(
   const cols = await getColumns(schema, table);
   const trigName = q(`_compact_cdc_${table}`);
   const oldName = `${table}__pre_compact`;
+  const pk = pkTuple(pkCols);
+  const pkSelect = pkCols.map(q).join(", ");
 
   // Collect index names from both tables before the swap
   const srcIndexes = await getIndexDefs(schema, table);
@@ -546,7 +578,7 @@ async function doSwap(
   // Pre-swap catch-up (no lock)
   info("Pre-swap catch-up replay...");
   let { seq, replayed } = await replayChanges(
-    schema, table, shadow, logTable, pkCol, replaySeq
+    schema, table, shadow, logTable, pkCols, replaySeq
   );
   let remaining = await countPendingChanges(logTable, seq);
   info(`  replayed ${replayed.toLocaleString()} changes, ${remaining.toLocaleString()} remain.`);
@@ -567,31 +599,33 @@ async function doSwap(
 
       // Final replay under lock
       const finalChanges = await tx.unsafe(
-        `SELECT seq, op, ${q(pkCol)}
+        `SELECT seq, op, ${pkSelect}
          FROM ${logTbl}
          WHERE seq > ${seq}
          ORDER BY seq`
       ) as { seq: string; op: string; [key: string]: string }[];
 
       if (finalChanges.length > 0) {
-        const latest = new Map<string, string>();
+        const latest = new Map<string, { op: string; vals: string[] }>();
         for (const row of finalChanges) {
-          latest.set(row[pkCol], row.op.trim());
+          const vals = pkCols.map(c => row[c]);
+          const key = vals.join("\0");
+          latest.set(key, { op: row.op.trim(), vals });
         }
 
-        const allIds = [...latest.keys()];
-        const upsertIds = allIds.filter((pk) => latest.get(pk) !== "D");
+        const allEntries = [...latest.values()];
+        const upsertEntries = allEntries.filter(e => e.op !== "D");
 
-        if (allIds.length > 0) {
-          const idList = allIds.map(lit).join(", ");
-          await tx.unsafe(`DELETE FROM ${dst} WHERE ${q(pkCol)} IN (${idList})`);
+        if (allEntries.length > 0) {
+          const idList = allEntries.map(e => pkLit(e.vals)).join(", ");
+          await tx.unsafe(`DELETE FROM ${dst} WHERE ${pk} IN (${idList})`);
         }
-        if (upsertIds.length > 0) {
-          const idList = upsertIds.map(lit).join(", ");
+        if (upsertEntries.length > 0) {
+          const idList = upsertEntries.map(e => pkLit(e.vals)).join(", ");
           await tx.unsafe(`
             INSERT INTO ${dst} (${cols})
             SELECT ${cols} FROM ${src}
-            WHERE ${q(pkCol)} IN (${idList})
+            WHERE ${pk} IN (${idList})
           `);
         }
 
@@ -685,12 +719,11 @@ async function cmdStart(schema: string, table: string, batchSize: number) {
   }
 
   const pkCols = await getPkColumns(schema, table);
-  const pkCol = pkCols[0];
   const shadow = `${table}__new`;
   const logTable = `${table}__log`;
 
   info(`Starting compaction of ${schema}.${table}`);
-  info(`  PK column:      ${pkCol}`);
+  info(`  PK column(s):    ${pkCols.join(", ")}`);
   info(`  Estimated rows:  ${(await getRowEstimate(schema, table)).toLocaleString()}`);
   info(`  Table size:      ${await getTableSizePretty(schema, table)}`);
   info(`  Batch size:      ${batchSize.toLocaleString()}`);
@@ -701,14 +734,14 @@ async function cmdStart(schema: string, table: string, batchSize: number) {
   await insertJob(schema, table, shadow, logTable, batchSize);
   await saveJob(schema, table, { phase: "copying" });
 
-  const result = await bulkCopy(schema, table, shadow, pkCol, batchSize, null, 0);
+  const result = await bulkCopy(schema, table, shadow, pkCols, batchSize, null, 0);
   if (!result.finished) return;
 
   await saveJob(schema, table, { phase: "indexing" });
   await createIndexes(schema, table, shadow);
 
   info("Replaying accumulated changes...");
-  const { seq, replayed } = await replayChanges(schema, table, shadow, logTable, pkCol, 0);
+  const { seq, replayed } = await replayChanges(schema, table, shadow, logTable, pkCols, 0);
   await saveJob(schema, table, { phase: "ready", replay_seq: seq });
   info(`Replayed ${replayed.toLocaleString()} changes. Ready for swap.`);
   info("");
@@ -721,7 +754,6 @@ async function cmdResume(schema: string, table: string, batchSize: number) {
   if (!job) die(`No job found for ${schema}.${table}. Use 'start' first.`);
 
   const pkCols = await getPkColumns(schema, table);
-  const pkCol = pkCols[0];
   const { shadow_table: shadow, log_table: logTable } = job;
   let phase = job.phase;
 
@@ -732,7 +764,8 @@ async function cmdResume(schema: string, table: string, batchSize: number) {
     await saveJob(schema, table, { phase: "copying" });
 
     const result = await bulkCopy(
-      schema, table, shadow, pkCol, batchSize, job.last_copied_id, job.rows_copied
+      schema, table, shadow, pkCols, batchSize,
+      deserializePk(job.last_copied_id), job.rows_copied
     );
     if (!result.finished) return;
     phase = "copied";
@@ -747,7 +780,7 @@ async function cmdResume(schema: string, table: string, batchSize: number) {
   if (phase === "indexed" || phase === "ready") {
     info("Replaying accumulated changes...");
     const { seq, replayed } = await replayChanges(
-      schema, table, shadow, logTable, pkCol, job.replay_seq
+      schema, table, shadow, logTable, pkCols, job.replay_seq
     );
     const remaining = await countPendingChanges(logTable, seq);
     await saveJob(schema, table, { phase: "ready", replay_seq: seq });
@@ -770,7 +803,7 @@ async function cmdSwap(schema: string, table: string, lockTimeoutMs: number) {
 
   const pkCols = await getPkColumns(schema, table);
   await doSwap(
-    schema, table, job.shadow_table, job.log_table, pkCols[0], job.replay_seq, lockTimeoutMs
+    schema, table, job.shadow_table, job.log_table, pkCols, job.replay_seq, lockTimeoutMs
   );
 }
 
