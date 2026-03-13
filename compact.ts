@@ -97,6 +97,36 @@ function fqn(schema: string, table: string): string {
   return `${q(schema)}.${q(table)}`;
 }
 
+// ─── Safe name generation ───────────────────────────────────────────────────
+
+const PG_NAMEMAX = 63;
+
+/** FNV-1a 32-bit hash, returned as 8 hex characters. */
+function fnv1a(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
+/**
+ * Build a PostgreSQL-safe identifier from prefix + base + suffix.
+ * If the result would exceed 63 characters, the base is truncated and a short
+ * hash of the original base is inserted to prevent collisions.
+ */
+function safeName(prefix: string, base: string, suffix: string): string {
+  const name = prefix + base + suffix;
+  if (name.length <= PG_NAMEMAX) return name;
+  const hash = fnv1a(base);
+  const room = PG_NAMEMAX - prefix.length - suffix.length - 1 - hash.length;
+  if (room < 1) {
+    return (prefix + hash + suffix).slice(0, PG_NAMEMAX);
+  }
+  return prefix + base.slice(0, room) + "_" + hash + suffix;
+}
+
 /** Row-value constructor for column references: (col1, col2, ...) */
 function pkTuple(pkCols: string[]): string {
   return `(${pkCols.map(q).join(", ")})`;
@@ -328,8 +358,8 @@ async function installTrigger(
 ) {
   const src = fqn(schema, table);
   const logTbl = fqn(COMPACT_SCHEMA, logTable);
-  const funcName = fqn(COMPACT_SCHEMA, `trig_${table}`);
-  const trigName = q(`_compact_cdc_${table}`);
+  const funcName = fqn(COMPACT_SCHEMA, safeName("trig_", table, ""));
+  const trigName = q(safeName("_compact_cdc_", table, ""));
 
   const oldRefs = pkCols.map((c) => `OLD.${q(c)}`).join(", ");
   const newRefs = pkCols.map((c) => `NEW.${q(c)}`).join(", ");
@@ -455,7 +485,7 @@ async function createIndexes(schema: string, table: string, shadow: string) {
   for (const idx of indexDefs) {
     let newDef = idx.indexdef.replace(/\bON\s+\S+\s+USING/, `ON ${dstFqn} USING`);
 
-    const newIdxName = `_compact_${idx.relname}`;
+    const newIdxName = safeName("_compact_", idx.relname, "");
     newDef = newDef.replace(
       /CREATE\s+(UNIQUE\s+)?INDEX\s+\S+/,
       (_, unique: string | undefined) => `CREATE ${unique || ""}INDEX ${q(newIdxName)}`
@@ -566,14 +596,13 @@ async function doSwap(
   const dst = fqn(COMPACT_SCHEMA, shadow);
   const logTbl = fqn(COMPACT_SCHEMA, logTable);
   const cols = await getColumns(schema, table);
-  const trigName = q(`_compact_cdc_${table}`);
-  const oldName = `${table}__pre_compact`;
+  const trigName = q(safeName("_compact_cdc_", table, ""));
+  const oldName = safeName("", table, "__pre_compact");
   const pk = pkTuple(pkCols);
   const pkSelect = pkCols.map(q).join(", ");
 
-  // Collect index names from both tables before the swap
+  // Collect index names from the source table before the swap
   const srcIndexes = await getIndexDefs(schema, table);
-  const shadowIndexes = await getIndexDefs(COMPACT_SCHEMA, shadow);
 
   // Pre-swap catch-up (no lock)
   info("Pre-swap catch-up replay...");
@@ -641,18 +670,14 @@ async function doSwap(
       // Rename indexes: first move old indexes out of the way, then give
       // the new indexes their original names.
       for (const idx of srcIndexes) {
+        const oldIdxName = safeName("", idx.relname, "__pre_compact");
+        const compactIdxName = safeName("_compact_", idx.relname, "");
         await tx.unsafe(
-          `ALTER INDEX ${fqn(schema, idx.relname)} RENAME TO ${q(idx.relname + "__pre_compact")}`
+          `ALTER INDEX ${fqn(schema, idx.relname)} RENAME TO ${q(oldIdxName)}`
         );
-      }
-      for (const idx of shadowIndexes) {
-        // Find the original name by stripping the _compact_ prefix
-        const origName = idx.relname.replace(/^_compact_/, "");
-        if (origName !== idx.relname) {
-          await tx.unsafe(
-            `ALTER INDEX ${fqn(schema, idx.relname)} RENAME TO ${q(origName)}`
-          );
-        }
+        await tx.unsafe(
+          `ALTER INDEX ${fqn(schema, compactIdxName)} RENAME TO ${q(idx.relname)}`
+        );
       }
 
       const elapsedMs = Date.now() - t0;
@@ -672,7 +697,7 @@ async function doSwap(
 
   // Clean up CDC artifacts (log table, trigger function, job row)
   try { await exec(`DROP TABLE IF EXISTS ${logTbl}`); } catch {}
-  try { await exec(`DROP FUNCTION IF EXISTS ${fqn(COMPACT_SCHEMA, `trig_${table}`)}()`); } catch {}
+  try { await exec(`DROP FUNCTION IF EXISTS ${fqn(COMPACT_SCHEMA, safeName("trig_", table, ""))}()`); } catch {}
   await exec(`
     DELETE FROM ${q(COMPACT_SCHEMA)}.jobs
     WHERE source_schema = ${lit(schema)} AND source_table = ${lit(table)}
@@ -692,12 +717,12 @@ async function doAbort(schema: string, table: string) {
   }
 
   const src = fqn(schema, table);
-  const trigName = q(`_compact_cdc_${table}`);
+  const trigName = q(safeName("_compact_cdc_", table, ""));
 
   try { await exec(`DROP TRIGGER IF EXISTS ${trigName} ON ${src}`); } catch {}
   try { await exec(`DROP TABLE IF EXISTS ${fqn(COMPACT_SCHEMA, job.shadow_table)}`); } catch {}
   try { await exec(`DROP TABLE IF EXISTS ${fqn(COMPACT_SCHEMA, job.log_table)}`); } catch {}
-  try { await exec(`DROP FUNCTION IF EXISTS ${fqn(COMPACT_SCHEMA, `trig_${table}`)}()`); } catch {}
+  try { await exec(`DROP FUNCTION IF EXISTS ${fqn(COMPACT_SCHEMA, safeName("trig_", table, ""))}()`); } catch {}
   await exec(`
     DELETE FROM ${q(COMPACT_SCHEMA)}.jobs
     WHERE source_schema = ${lit(schema)} AND source_table = ${lit(table)}
@@ -719,8 +744,8 @@ async function cmdStart(schema: string, table: string, batchSize: number) {
   }
 
   const pkCols = await getPkColumns(schema, table);
-  const shadow = `${table}__new`;
-  const logTable = `${table}__log`;
+  const shadow = safeName("", table, "__new");
+  const logTable = safeName("", table, "__log");
 
   info(`Starting compaction of ${schema}.${table}`);
   info(`  PK column(s):    ${pkCols.join(", ")}`);
